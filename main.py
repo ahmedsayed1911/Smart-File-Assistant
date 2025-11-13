@@ -13,17 +13,17 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
 
 # --------------------------
-# API KEY (نفس طريقة الراج القديم)
+# API KEY
 # --------------------------
 api_key = st.secrets.get("GROQ_API_KEY")
 if not api_key:
-    st.error("❌ Add GROQ_API_KEY inside Streamlit Secrets.")
+    st.error("❌ Add GROQ_API_KEY in Streamlit Secrets.")
     st.stop()
 
 # --------------------------
-# APP UI
+# UI Setup
 # --------------------------
-st.set_page_config(page_title="Universal RAG System")
+st.set_page_config(page_title="Smart File Assistant", layout="wide")
 st.title("📘 Multi-File RAG System + Smart Recommendations")
 
 uploaded_files = st.file_uploader(
@@ -33,7 +33,7 @@ uploaded_files = st.file_uploader(
 )
 
 # --------------------------
-# LOAD FILES
+# LOAD FILES (FIXED VERSION)
 # --------------------------
 def load_file(uploaded_file):
     suffix = uploaded_file.name.split(".")[-1].lower()
@@ -52,17 +52,28 @@ def load_file(uploaded_file):
         loader = TextLoader(path)
         docs = loader.load()
 
-    # CSV
+    # CSV → Convert to text block
     elif suffix == "csv":
         df = pd.read_csv(path)
         text = df.to_string()
         docs = [{"page_content": text, "metadata": {"source_file": uploaded_file.name}}]
 
-    # Add metadata
-    for d in docs:
-        d.metadata["source_file"] = uploaded_file.name
+    else:
+        return []
 
-    return docs
+    # FIX: Proper metadata handling
+    cleaned_docs = []
+    for d in docs:
+        if hasattr(d, "metadata"):
+            d.metadata["source_file"] = uploaded_file.name
+            cleaned_docs.append(d)
+
+        elif isinstance(d, dict):
+            d["metadata"]["source_file"] = uploaded_file.name
+            cleaned_docs.append(d)
+
+    return cleaned_docs
+
 
 # --------------------------
 # BUILD RAG
@@ -73,16 +84,17 @@ if uploaded_files:
     for f in uploaded_files:
         all_docs.extend(load_file(f))
 
-    st.success(f"✔ Loaded {len(all_docs)} documents from {len(uploaded_files)} files.")
+    st.success(f"✔ Loaded {len(all_docs)} entries from {len(uploaded_files)} files.")
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
     chunks = splitter.split_documents(all_docs)
 
     embedding = FastEmbedEmbeddings()
     vectorstore = Chroma.from_documents(chunks, embedding=embedding)
+
     retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
 
-    # LLM (نفس الراج سيستم 100%)
+    # LLM
     llm = ChatOpenAI(
         model="llama-3.3-70b-versatile",
         openai_api_base="https://api.groq.com/openai/v1",
@@ -108,6 +120,9 @@ if uploaded_files:
         | StrOutputParser()
     )
 
+    # --------------------------
+    # ASKING
+    # --------------------------
     st.divider()
     question = st.text_input("💬 Ask anything about your files:")
 
@@ -121,16 +136,19 @@ if uploaded_files:
         # Recommendations
         st.subheader("✨ Related Sections (Recommendations)")
         similar_docs = vectorstore.similarity_search(question, k=4)
+
         for doc in similar_docs:
             st.markdown(f"**📌 From file:** `{doc.metadata.get('source_file')}`")
-            st.write(doc.page_content[:350] + "...")
+            st.write(doc.page_content[:400] + "...")
             st.divider()
 
-        # Follow-Up Questions
+        # Follow-Up
         st.subheader("💡 Suggested Follow-up Questions")
-        q_prompt = f"Suggest 5 follow-up questions for: '{question}'."
-        suggestions = llm.invoke(q_prompt)
-        st.write(suggestions.content)
+
+        q_prompt = f"Suggest 5 deeper follow-up questions for: '{question}'."
+        followups = llm.invoke(q_prompt)
+
+        st.write(followups.content)
 
 else:
     st.info("⬆ Upload some files to get started.")

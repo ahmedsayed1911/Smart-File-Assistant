@@ -7,6 +7,7 @@ from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
 from langchain_community.vectorstores import Chroma
+from langchain_core.documents import Document
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -17,7 +18,7 @@ from langchain_core.runnables import RunnablePassthrough
 # --------------------------
 api_key = st.secrets.get("GROQ_API_KEY")
 if not api_key:
-    st.error("❌ Add GROQ_API_KEY in Streamlit Secrets.")
+    st.error("❌ Add GROQ_API_KEY inside Streamlit Secrets.")
     st.stop()
 
 # --------------------------
@@ -33,7 +34,7 @@ uploaded_files = st.file_uploader(
 )
 
 # --------------------------
-# LOAD FILES (FIXED VERSION)
+# LOAD FILES — FIXED & CLEAN
 # --------------------------
 def load_file(uploaded_file):
     suffix = uploaded_file.name.split(".")[-1].lower()
@@ -52,31 +53,40 @@ def load_file(uploaded_file):
         loader = TextLoader(path)
         docs = loader.load()
 
-    # CSV → Convert to text block
+    # CSV → convert whole table to text
     elif suffix == "csv":
         df = pd.read_csv(path)
         text = df.to_string()
-        docs = [{"page_content": text, "metadata": {"source_file": uploaded_file.name}}]
+        docs = [
+            Document(
+                page_content=text,
+                metadata={"source_file": uploaded_file.name}
+            )
+        ]
 
     else:
         return []
 
-    # FIX: Proper metadata handling
-    cleaned_docs = []
+    # Ensure every doc is LangChain Document
+    cleaned = []
     for d in docs:
-        if hasattr(d, "metadata"):
+        if isinstance(d, Document):
             d.metadata["source_file"] = uploaded_file.name
-            cleaned_docs.append(d)
+            cleaned.append(d)
+        else:
+            # Convert dict to Document (if ever happens)
+            cleaned.append(
+                Document(
+                    page_content=d["page_content"],
+                    metadata=d.get("metadata", {"source_file": uploaded_file.name})
+                )
+            )
 
-        elif isinstance(d, dict):
-            d["metadata"]["source_file"] = uploaded_file.name
-            cleaned_docs.append(d)
-
-    return cleaned_docs
+    return cleaned
 
 
 # --------------------------
-# BUILD RAG
+# BUILD RAG PIPELINE
 # --------------------------
 if uploaded_files:
 
@@ -84,17 +94,18 @@ if uploaded_files:
     for f in uploaded_files:
         all_docs.extend(load_file(f))
 
-    st.success(f"✔ Loaded {len(all_docs)} entries from {len(uploaded_files)} files.")
+    st.success(f"✔ Loaded {len(all_docs)} documents from {len(uploaded_files)} files.")
 
+    # Chunking
     splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
     chunks = splitter.split_documents(all_docs)
 
+    # Embeddings & Vector Store
     embedding = FastEmbedEmbeddings()
     vectorstore = Chroma.from_documents(chunks, embedding=embedding)
-
     retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
 
-    # LLM
+    # LLM (Groq)
     llm = ChatOpenAI(
         model="llama-3.3-70b-versatile",
         openai_api_base="https://api.groq.com/openai/v1",
@@ -105,7 +116,7 @@ if uploaded_files:
 
     prompt = ChatPromptTemplate.from_template("""
     Use the following context to answer the question.
-    If you don't know the answer, say "I don’t know."
+    If you don't know the answer, say "I don't know."
 
     Context:
     {context}
@@ -121,7 +132,7 @@ if uploaded_files:
     )
 
     # --------------------------
-    # ASKING
+    # ASK QUESTION
     # --------------------------
     st.divider()
     question = st.text_input("💬 Ask anything about your files:")
@@ -133,22 +144,25 @@ if uploaded_files:
         st.subheader("🧠 Answer")
         st.write(answer)
 
-        # Recommendations
-        st.subheader("✨ Related Sections (Recommendations)")
-        similar_docs = vectorstore.similarity_search(question, k=4)
+        # --------------------------
+        # RECOMMENDATIONS
+        # --------------------------
+        st.subheader("✨ Related Sections")
 
+        similar_docs = vectorstore.similarity_search(question, k=4)
         for doc in similar_docs:
-            st.markdown(f"**📌 From file:** `{doc.metadata.get('source_file')}`")
+            st.markdown(f"**📌 From:** `{doc.metadata.get('source_file')}`")
             st.write(doc.page_content[:400] + "...")
             st.divider()
 
-        # Follow-Up
+        # --------------------------
+        # FOLLOW-UP QUESTIONS
+        # --------------------------
         st.subheader("💡 Suggested Follow-up Questions")
 
         q_prompt = f"Suggest 5 deeper follow-up questions for: '{question}'."
-        followups = llm.invoke(q_prompt)
-
-        st.write(followups.content)
+        follow = llm.invoke(q_prompt)
+        st.write(follow.content)
 
 else:
     st.info("⬆ Upload some files to get started.")

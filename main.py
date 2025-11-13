@@ -13,17 +13,17 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
 
-# --------------------------
+# -------------------------------------
 # API KEY
-# --------------------------
+# -------------------------------------
 api_key = st.secrets.get("GROQ_API_KEY")
 if not api_key:
-    st.error("❌ Add GROQ_API_KEY inside Streamlit Secrets.")
+    st.error("❌ Please add GROQ_API_KEY in Streamlit Secrets.")
     st.stop()
 
-# --------------------------
-# UI Setup
-# --------------------------
+# -------------------------------------
+# UI
+# -------------------------------------
 st.set_page_config(page_title="Smart File Assistant", layout="wide")
 st.title("📘 Multi-File RAG System + Smart Recommendations")
 
@@ -33,27 +33,26 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True
 )
 
-# --------------------------
-# LOAD FILES — FIXED & CLEAN
-# --------------------------
+# -------------------------------------
+# FILE LOADING
+# -------------------------------------
 def load_file(uploaded_file):
     suffix = uploaded_file.name.split(".")[-1].lower()
 
+    # Save temporarily
     with tempfile.NamedTemporaryFile(delete=False, suffix=f".{suffix}") as tmp:
         tmp.write(uploaded_file.read())
         path = tmp.name
 
-    # PDF
+    # Process file types
     if suffix == "pdf":
         loader = PyPDFLoader(path)
         docs = loader.load()
 
-    # TXT
     elif suffix == "txt":
         loader = TextLoader(path)
         docs = loader.load()
 
-    # CSV → convert whole table to text
     elif suffix == "csv":
         df = pd.read_csv(path)
         text = df.to_string()
@@ -67,27 +66,25 @@ def load_file(uploaded_file):
     else:
         return []
 
-    # Ensure every doc is LangChain Document
-    cleaned = []
+    # Ensure all are LangChain Documents
+    cleaned_docs = []
     for d in docs:
         if isinstance(d, Document):
             d.metadata["source_file"] = uploaded_file.name
-            cleaned.append(d)
-        else:
-            # Convert dict to Document (if ever happens)
-            cleaned.append(
+            cleaned_docs.append(d)
+        else:  # if raw dict (rare)
+            cleaned_docs.append(
                 Document(
                     page_content=d["page_content"],
                     metadata=d.get("metadata", {"source_file": uploaded_file.name})
                 )
             )
 
-    return cleaned
+    return cleaned_docs
 
-
-# --------------------------
+# -------------------------------------
 # BUILD RAG PIPELINE
-# --------------------------
+# -------------------------------------
 if uploaded_files:
 
     all_docs = []
@@ -96,16 +93,17 @@ if uploaded_files:
 
     st.success(f"✔ Loaded {len(all_docs)} documents from {len(uploaded_files)} files.")
 
-    # Chunking
+    # Split documents
     splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
     chunks = splitter.split_documents(all_docs)
 
-    # Embeddings & Vector Store
+    # Vector DB
     embedding = FastEmbedEmbeddings()
     vectorstore = Chroma.from_documents(chunks, embedding=embedding)
+
     retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
 
-    # LLM (Groq)
+    # LLM setup (Groq)
     llm = ChatOpenAI(
         model="llama-3.3-70b-versatile",
         openai_api_base="https://api.groq.com/openai/v1",
@@ -131,38 +129,47 @@ if uploaded_files:
         | StrOutputParser()
     )
 
-    # --------------------------
-    # ASK QUESTION
-    # --------------------------
+    # -------------------------------------
+    # ASK (UI same as RAG System)
+    # -------------------------------------
     st.divider()
-    question = st.text_input("💬 Ask anything about your files:")
+    st.subheader("💬 Ask Your Question")
 
-    if st.button("Get Answer") and question:
+    question = st.text_area(
+        "Type your question:",
+        height=120,
+        placeholder="Ask anything about your PDFs, CSVs, or TXT files..."
+    )
+
+    if st.button("🔍 Get Answer", use_container_width=True) and question:
+
         with st.spinner("🤖 Thinking..."):
             answer = rag_chain.invoke(question)
 
-        st.subheader("🧠 Answer")
-        st.write(answer)
+        # ------------------ ANSWER ------------------
+        st.markdown("### 🧠 Answer")
+        st.success(answer)
 
-        # --------------------------
-        # RECOMMENDATIONS
-        # --------------------------
-        st.subheader("✨ Related Sections")
+        # ------------------ RECOMMENDATIONS (Auto) ------------------
+        st.markdown("### ✨ Related Sections (Recommendations)")
+        related_docs = vectorstore.similarity_search(question, k=4)
 
-        similar_docs = vectorstore.similarity_search(question, k=4)
-        for doc in similar_docs:
-            st.markdown(f"**📌 From:** `{doc.metadata.get('source_file')}`")
-            st.write(doc.page_content[:400] + "...")
-            st.divider()
+        if len(related_docs) > 0:
+            for doc in related_docs:
+                st.info(
+                    f"📌 **Source:** `{doc.metadata.get('source_file')}`\n\n"
+                    f"{doc.page_content[:350]}..."
+                )
+        else:
+            st.info("No related sections found.")
 
-        # --------------------------
-        # FOLLOW-UP QUESTIONS
-        # --------------------------
-        st.subheader("💡 Suggested Follow-up Questions")
+        # ------------------ FOLLOW-UP Questions ------------------
+        st.markdown("### 💡 Suggested Follow-up Questions")
 
-        q_prompt = f"Suggest 5 deeper follow-up questions for: '{question}'."
-        follow = llm.invoke(q_prompt)
-        st.write(follow.content)
+        follow_prompt = f"Suggest 5 deeper follow-up questions for: '{question}'."
+        follow = llm.invoke(follow_prompt)
+
+        st.warning(follow.content)
 
 else:
-    st.info("⬆ Upload some files to get started.")
+    st.info("⬆ Upload files (PDF / TXT / CSV) to get started.")

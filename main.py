@@ -14,76 +14,73 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
 
 # -------------------------------------
-# API KEY
+# API KEY (Groq)
 # -------------------------------------
 api_key = st.secrets.get("GROQ_API_KEY")
 if not api_key:
-    st.error("❌ Please add GROQ_API_KEY in Streamlit Secrets.")
+    st.error("❌ Please add GROQ_API_KEY to Streamlit Secrets.")
     st.stop()
 
 # -------------------------------------
 # UI
 # -------------------------------------
 st.set_page_config(page_title="Smart File Assistant", layout="wide")
-st.title("📘 Multi-File RAG System + Smart Recommendations")
+st.title("📘 Smart File Assistant — Multilingual RAG + Auto-Translation + Recommendations")
 
 uploaded_files = st.file_uploader(
-    "Upload files: PDF / TXT / CSV",
+    "Upload your files (PDF / TXT / CSV)",
     type=["pdf", "txt", "csv"],
     accept_multiple_files=True
 )
 
+
 # -------------------------------------
-# FILE LOADING
+# FILE LOADER
 # -------------------------------------
 def load_file(uploaded_file):
     suffix = uploaded_file.name.split(".")[-1].lower()
 
-    # Save temporarily
+    # save temp file
     with tempfile.NamedTemporaryFile(delete=False, suffix=f".{suffix}") as tmp:
         tmp.write(uploaded_file.read())
         path = tmp.name
 
-    # Process file types
+    # PDF
     if suffix == "pdf":
         loader = PyPDFLoader(path)
         docs = loader.load()
 
+    # TXT
     elif suffix == "txt":
-        loader = TextLoader(path)
-        docs = loader.load()
+        docs = TextLoader(path).load()
 
+    # CSV → convert to text
     elif suffix == "csv":
         df = pd.read_csv(path)
         text = df.to_string()
-        docs = [
-            Document(
-                page_content=text,
-                metadata={"source_file": uploaded_file.name}
-            )
-        ]
+        docs = [Document(page_content=text, metadata={"source_file": uploaded_file.name})]
 
     else:
         return []
 
-    # Ensure all are LangChain Documents
-    cleaned_docs = []
+    # Convert all to Document
+    cleaned = []
     for d in docs:
         if isinstance(d, Document):
             d.metadata["source_file"] = uploaded_file.name
-            cleaned_docs.append(d)
-        else:  # if raw dict (rare)
-            cleaned_docs.append(
+            cleaned.append(d)
+        else:
+            cleaned.append(
                 Document(
-                    page_content=d["page_content"],
+                    page_content=d.get("page_content", str(d)),
                     metadata=d.get("metadata", {"source_file": uploaded_file.name})
                 )
             )
+    return cleaned
 
-    return cleaned_docs
 
 # -------------------------------------
-# BUILD RAG PIPELINE
+# PROCESS FILES
 # -------------------------------------
 if uploaded_files:
 
@@ -93,17 +90,16 @@ if uploaded_files:
 
     st.success(f"✔ Loaded {len(all_docs)} documents from {len(uploaded_files)} files.")
 
-    # Split documents
+    # split docs
     splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
     chunks = splitter.split_documents(all_docs)
 
-    # Vector DB
+    # embeddings + vector DB
     embedding = FastEmbedEmbeddings()
     vectorstore = Chroma.from_documents(chunks, embedding=embedding)
-
     retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
 
-    # LLM setup (Groq)
+    # LLM
     llm = ChatOpenAI(
         model="llama-3.3-70b-versatile",
         openai_api_base="https://api.groq.com/openai/v1",
@@ -112,16 +108,29 @@ if uploaded_files:
         max_tokens=512
     )
 
+    # -------------------------------------
+    # MULTILINGUAL + AUTO-TRANSLATION PROMPT
+    # -------------------------------------
     prompt = ChatPromptTemplate.from_template("""
-    Use the following context to answer the question.
-    If you don't know the answer, say "I don't know."
+You are a multilingual AI assistant with automatic translation.
 
-    Context:
-    {context}
+Rules:
+1. Detect the language of the user's question.
+2. Translate context internally if needed.
+3. Answer ONLY in the user's language.
+4. Ensure accuracy. Do NOT hallucinate.
+5. If the answer is not in the context, say the equivalent of "I don't know" in the user's language.
 
-    Question: {question}
-    """)
+Context:
+{context}
 
+User question:
+{question}
+
+Your answer (in the user's language):
+""")
+
+    # RAG chain
     rag_chain = (
         {"context": retriever, "question": RunnablePassthrough()}
         | prompt
@@ -130,46 +139,43 @@ if uploaded_files:
     )
 
     # -------------------------------------
-    # ASK (UI same as RAG System)
+    # QUESTION UI
     # -------------------------------------
     st.divider()
-    st.subheader("💬 Ask Your Question")
+    st.subheader("💬 Ask your question")
 
     question = st.text_area(
-        "Type your question:",
+        "Type your question (Arabic / English / any language):",
         height=120,
-        placeholder="Ask anything about your PDFs, CSVs, or TXT files..."
+        placeholder="Example: لخص البيانات — Summarize the dataset — Résume le fichier..."
     )
 
     if st.button("🔍 Get Answer", use_container_width=True) and question:
 
-        with st.spinner("🤖 Thinking..."):
+        with st.spinner("🤖 Thinking and translating..."):
             answer = rag_chain.invoke(question)
 
         # ------------------ ANSWER ------------------
         st.markdown("### 🧠 Answer")
         st.success(answer)
 
-        # ------------------ RECOMMENDATIONS (Auto) ------------------
-        st.markdown("### ✨ Related Sections (Recommendations)")
+        # ------------------ RECOMMENDATIONS ------------------
+        st.markdown("### ✨ Related Sections")
         related_docs = vectorstore.similarity_search(question, k=4)
 
-        if len(related_docs) > 0:
-            for doc in related_docs:
-                st.info(
-                    f"📌 **Source:** `{doc.metadata.get('source_file')}`\n\n"
-                    f"{doc.page_content[:350]}..."
-                )
-        else:
-            st.info("No related sections found.")
+        for doc in related_docs:
+            st.info(
+                f"📌 **Source:** `{doc.metadata.get('source_file')}`\n\n"
+                f"{doc.page_content[:350]}..."
+            )
 
-        # ------------------ FOLLOW-UP Questions ------------------
+        # ------------------ FOLLOW-UP QUESTIONS ------------------
         st.markdown("### 💡 Suggested Follow-up Questions")
 
-        follow_prompt = f"Suggest 5 deeper follow-up questions for: '{question}'."
+        follow_prompt = f"Suggest 5 follow-up questions for: '{question}' — in the same language."
         follow = llm.invoke(follow_prompt)
 
         st.warning(follow.content)
 
 else:
-    st.info("⬆ Upload files (PDF / TXT / CSV) to get started.")
+    st.info("⬆ Upload files to start.")

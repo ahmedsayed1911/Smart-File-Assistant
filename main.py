@@ -152,12 +152,14 @@ if uploaded_files:
 
         embedding = FastEmbedEmbeddings()
         # build persistent chroma DB
-        vectorstore = Chroma.from_documents(
-            chunks,
+        vectorstore = Chroma(
+            collection_name="my_docs",
             embedding_function=embedding,
-            persist_directory=PERSIST_DIR,
-            collection_name="my_docs"
+            persist_directory=PERSIST_DIR
         )
+
+        vectorstore.add_documents(chunks)
+        vectorstore.persist()
         # persist and save fingerprints
         try:
             vectorstore.persist()

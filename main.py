@@ -2,16 +2,33 @@ import streamlit as st
 import os
 import tempfile
 import pandas as pd
+import hashlib
+import json
+from typing import List
 
-from langchain_community.document_loaders import PyPDFLoader, TextLoader
+# faster PDF reader
+from pypdf import PdfReader
+
+from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
 from langchain_community.vectorstores import Chroma
-from langchain_core.documents import Document
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
+
+# -------------------------------
+# Config
+# -------------------------------
+PERSIST_DIR = "chroma_db"
+PROCESSED_FILES_META = os.path.join(PERSIST_DIR, "files.json")
+CHUNK_SIZE = 800
+CHUNK_OVERLAP = 100
+RETRIEVE_K = 2
+
+st.set_page_config(page_title="Smart File Assistant — Fast", layout="wide")
+st.title("📘 Smart File Assistant — Fast + Persistent RAG")
 
 # -------------------------------------
 # API KEY (Groq)
@@ -22,40 +39,53 @@ if not api_key:
     st.stop()
 
 # -------------------------------------
-# UI
+# Helpers
 # -------------------------------------
-st.set_page_config(page_title="Smart File Assistant", layout="wide")
-st.title("📘 Smart File Assistant — Multilingual RAG + Auto-Translation + Recommendations")
 
-uploaded_files = st.file_uploader(
-    "Upload your files (PDF / TXT / CSV)",
-    type=["pdf", "txt", "csv"],
-    accept_multiple_files=True
-)
+def file_hash_bytes(content: bytes) -> str:
+    h = hashlib.sha256()
+    h.update(content)
+    return h.hexdigest()
 
 
-# -------------------------------------
-# FILE LOADER
-# -------------------------------------
-def load_file(uploaded_file):
+def compute_uploads_fingerprint(uploaded_files) -> dict:
+    meta = {}
+    for f in uploaded_files:
+        b = f.read()
+        h = file_hash_bytes(b)
+        meta[f.name] = {"hash": h, "size": len(b)}
+        # rewind for later use
+        f.seek(0)
+    return meta
+
+
+def read_pdf_text(path: str) -> str:
+    reader = PdfReader(path)
+    pages = []
+    for p in reader.pages:
+        text = p.extract_text() or ""
+        pages.append(text)
+    return "\n".join(pages)
+
+
+def load_file_to_docs(uploaded_file) -> List[Document]:
     suffix = uploaded_file.name.split(".")[-1].lower()
 
     # save temp file
-    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{suffix}") as tmp:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{suffix}') as tmp:
         tmp.write(uploaded_file.read())
         path = tmp.name
 
-    # PDF
-    if suffix == "pdf":
-        loader = PyPDFLoader(path)
-        docs = loader.load()
+    docs = []
+    if suffix == 'pdf':
+        text = read_pdf_text(path)
+        docs = [Document(page_content=text, metadata={"source_file": uploaded_file.name})]
 
-    # TXT
-    elif suffix == "txt":
-        docs = TextLoader(path).load()
+    elif suffix == 'txt':
+        text = open(path, 'r', encoding='utf-8', errors='ignore').read()
+        docs = [Document(page_content=text, metadata={"source_file": uploaded_file.name})]
 
-    # CSV → convert to text
-    elif suffix == "csv":
+    elif suffix == 'csv':
         df = pd.read_csv(path)
         text = df.to_string()
         docs = [Document(page_content=text, metadata={"source_file": uploaded_file.name})]
@@ -63,43 +93,84 @@ def load_file(uploaded_file):
     else:
         return []
 
-    # Convert all to Document
-    cleaned = []
-    for d in docs:
-        if isinstance(d, Document):
-            d.metadata["source_file"] = uploaded_file.name
-            cleaned.append(d)
-        else:
-            cleaned.append(
-                Document(
-                    page_content=d.get("page_content", str(d)),
-                    metadata=d.get("metadata", {"source_file": uploaded_file.name})
-                )
-            )
-    return cleaned
+    return docs
 
 
 # -------------------------------------
-# PROCESS FILES
+# UI: Upload
+# -------------------------------------
+uploaded_files = st.file_uploader(
+    "Upload your files (PDF / TXT / CSV)",
+    type=["pdf", "txt", "csv"],
+    accept_multiple_files=True
+)
+
+# ensure persist dir exists
+os.makedirs(PERSIST_DIR, exist_ok=True)
+
+# -------------------------------------
+# If files uploaded: build or reuse DB
 # -------------------------------------
 if uploaded_files:
+    st.info("🔁 Checking files and preparing (fast path enabled)")
 
-    all_docs = []
-    for f in uploaded_files:
-        all_docs.extend(load_file(f))
+    fingerprint = compute_uploads_fingerprint(uploaded_files)
 
-    st.success(f"✔ Loaded {len(all_docs)} documents from {len(uploaded_files)} files.")
+    # check if we've already processed same set
+    processed = {}
+    if os.path.exists(PROCESSED_FILES_META):
+        try:
+            with open(PROCESSED_FILES_META, 'r', encoding='utf-8') as f:
+                processed = json.load(f)
+        except Exception:
+            processed = {}
 
-    # split docs
-    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
-    chunks = splitter.split_documents(all_docs)
+    # if same fingerprint, reuse existing DB
+    if processed == fingerprint and os.listdir(PERSIST_DIR):
+        st.success("✔ Using existing vector DB (no reprocessing).")
+        embedding = FastEmbedEmbeddings()
+        vectorstore = Chroma(persist_directory=PERSIST_DIR, embedding_function=embedding)
+    else:
+        # process files and build vector store (this runs once)
+        st.info("📦 Processing files — this happens only once per changed upload set.")
 
-    # embeddings + vector DB
-    embedding = FastEmbedEmbeddings()
-    vectorstore = Chroma.from_documents(chunks, embedding=embedding)
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+        all_docs = []
+        progress = st.progress(0)
+        total = len(uploaded_files)
+        i = 0
+        for f in uploaded_files:
+            docs = load_file_to_docs(f)
+            all_docs.extend(docs)
+            i += 1
+            progress.progress(int(i / total * 100))
 
+        # split docs (larger chunk size -> fewer embeddings)
+        splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+        chunks = splitter.split_documents(all_docs)
+
+        st.info(f"🔢 Created {len(chunks)} chunks — computing embeddings & building Chroma DB...")
+
+        embedding = FastEmbedEmbeddings()
+        # build persistent chroma DB
+        vectorstore = Chroma.from_documents(
+            chunks,
+            embedding_function=embedding,
+            persist_directory=PERSIST_DIR,
+            collection_name="my_docs"
+        )
+        # persist and save fingerprints
+        try:
+            vectorstore.persist()
+            with open(PROCESSED_FILES_META, 'w', encoding='utf-8') as f:
+                json.dump(fingerprint, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            st.warning(f"Could not persist vector DB: {e}")
+
+    retriever = vectorstore.as_retriever(search_kwargs={"k": RETRIEVE_K})
+
+    # -------------------------------------
     # LLM
+    # -------------------------------------
     llm = ChatOpenAI(
         model="llama-3.3-70b-versatile",
         openai_api_base="https://api.groq.com/openai/v1",
@@ -108,10 +179,8 @@ if uploaded_files:
         max_tokens=512
     )
 
-    # -------------------------------------
-    # MULTILINGUAL + AUTO-TRANSLATION PROMPT
-    # -------------------------------------
-    prompt = ChatPromptTemplate.from_template("""
+    prompt = ChatPromptTemplate.from_template(
+        """
 You are a multilingual AI assistant with automatic translation.
 
 Rules:
@@ -128,9 +197,9 @@ User question:
 {question}
 
 Your answer (in the user's language):
-""")
+"""
+    )
 
-    # RAG chain
     rag_chain = (
         {"context": retriever, "question": RunnablePassthrough()}
         | prompt
@@ -151,17 +220,14 @@ Your answer (in the user's language):
     )
 
     if st.button("🔍 Get Answer", use_container_width=True) and question:
-
         with st.spinner("🤖 Thinking and translating..."):
             answer = rag_chain.invoke(question)
 
-        # ------------------ ANSWER ------------------
         st.markdown("### 🧠 Answer")
         st.success(answer)
 
-        # ------------------ RECOMMENDATIONS ------------------
         st.markdown("### ✨ Related Sections")
-        related_docs = vectorstore.similarity_search(question, k=4)
+        related_docs = vectorstore.similarity_search(question, k=RETRIEVE_K)
 
         for doc in related_docs:
             st.info(
@@ -169,13 +235,10 @@ Your answer (in the user's language):
                 f"{doc.page_content[:350]}..."
             )
 
-        # ------------------ FOLLOW-UP QUESTIONS ------------------
         st.markdown("### 💡 Suggested Follow-up Questions")
-
         follow_prompt = f"Suggest 5 follow-up questions for: '{question}' — in the same language."
         follow = llm.invoke(follow_prompt)
-
-        st.warning(follow.content)
+        st.warning(getattr(follow, 'content', str(follow)))
 
 else:
     st.info("⬆ Upload files to start.")
